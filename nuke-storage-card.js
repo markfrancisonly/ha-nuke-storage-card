@@ -1,19 +1,15 @@
 // nuke-storage-card.js
 // Home Assistant custom card: Nuke Storage Card
-// Dialog with checkboxes for which storage to clear, then (optionally) reload.
-// Uses ha-button with minimal styling to match default Home Assistant appearance.
-// Initial log shows current storage state with counts and sizes.
-// Editor saves config on Enter key or Save button.
-// Dialog Cancel button uses appearance="plain", Okay button renamed to "Nuke" with appearance="brand".
-// v1.0.14
+// Dialog with checkboxes for which storage to clear, then reloads.
+// v1.0.30
 
 (() => {
   const DEFAULTS = {
     title: "Nuke Storage Card",
-    description: "Choose what to clear for this origin. Actions include localStorage, sessionStorage, cookies, IndexedDB, Cache Storage, and Service Workers.",
+    description:
+      "Choose what to clear for this origin. Actions include localStorage, sessionStorage, cookies, IndexedDB, Cache Storage, and Service Workers.",
     button_label: "Choose",
-    show_details: true,
-    default_reload_after: true
+    show_details: true
   };
 
   // -------- Utilities --------
@@ -26,110 +22,182 @@
   };
 
   const clearLocalStorage = async (log) => {
-    try { localStorage.clear(); log("localStorage: cleared"); }
-    catch (e) { log(`localStorage: ${e}`); }
+    try {
+      localStorage.clear();
+      try {
+        for (const k of Object.keys(localStorage)) localStorage.removeItem(k);
+      } catch {}
+    } catch (e) {
+      log(`localStorage: error ${e}`);
+    }
   };
 
   const clearSessionStorage = async (log) => {
-    try { sessionStorage.clear(); log("sessionStorage: cleared"); }
-    catch (e) { log(`sessionStorage: ${e}`); }
+    try {
+      sessionStorage.clear();
+      try {
+        for (const k of Object.keys(sessionStorage))
+          sessionStorage.removeItem(k);
+      } catch {}
+    } catch (e) {
+      log(`sessionStorage: error ${e}`);
+    }
   };
 
   const clearCookies = async (log) => {
     try {
       const cookies = document.cookie ? document.cookie.split(";") : [];
       const names = cookies.map((c) => c.split("=")[0].trim()).filter(Boolean);
-      if (!names.length) { log("cookies: none visible"); return; }
+      if (!names.length) return;
 
       const hostParts = location.hostname.split(".").filter(Boolean);
       const domainVariants = [];
       for (let i = 0; i < hostParts.length; i++) {
         const d = hostParts.slice(i).join(".");
-        domainVariants.push(d);
-        domainVariants.push("." + d);
+        domainVariants.push(d, "." + d);
       }
       const pathVariants = (() => {
         const segs = location.pathname.split("/").filter(Boolean);
         const paths = ["/"];
         let curr = "";
-        for (const s of segs) { curr += "/" + s; paths.push(curr); }
+        for (const s of segs) {
+          curr += "/" + s;
+          paths.push(curr);
+        }
         return Array.from(new Set(paths));
       })();
 
-      const expireStr = "expires=Thu, 01 Jan 1970 00:00:00 GMT";
-      let attempts = 0;
+      const expireStr = "expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0";
+      const secure = location.protocol === "https:" ? "; Secure" : "";
+
       for (const name of names) {
         for (const path of pathVariants) {
-          document.cookie = `${name}=; ${expireStr}; path=${path}`; attempts++;
+          document.cookie = `${name}=; ${expireStr}; path=${path}${secure}`;
           for (const domain of domainVariants) {
-            document.cookie = `${name}=; ${expireStr}; path=${path}; domain=${domain}`; attempts++;
+            document.cookie = `${name}=; ${expireStr}; path=${path}; domain=${domain}${secure}`;
           }
         }
       }
-      log(`cookies: attempted to expire ${names.length} cookie(s) across ${attempts} combos (HttpOnly not removable client-side)`);
     } catch (e) {
-      log(`cookies: ${e}`);
+      log(`Cookies: error ${e}`);
     }
   };
 
   const clearIndexedDBAll = async (log) => {
-    try {
-      const deleted = [];
-      if (indexedDB && "databases" in indexedDB && indexedDB.databases) {
-        const dbs = await indexedDB.databases();
-        for (const db of dbs) {
-          if (!db?.name) continue;
-          await new Promise((res) => {
-            const req = indexedDB.deleteDatabase(db.name);
-            req.onsuccess = req.onerror = req.onblocked = () => res();
-          });
-          deleted.push(db.name);
+    // Delete one DB name with guards; only log actual errors.
+    const deleteDb = (name, timeoutMs = 4000) =>
+      new Promise((resolve) => {
+        let settled = false;
+        let timer = setTimeout(() => {
+          // Treat long blocks as "timeout" (not an error); status will reflect remaining DBs later.
+          if (!settled) {
+            settled = true;
+            resolve("timeout");
+          }
+        }, timeoutMs);
+
+        let req;
+        try {
+          req = indexedDB.deleteDatabase(name);
+        } catch (e) {
+          clearTimeout(timer);
+          if (!settled) {
+            settled = true;
+            log?.(`IndexedDB: error deleting "${name}": ${e}`);
+            resolve("error");
+          }
+          return;
         }
-      } else {
-        const guesses = ["home-assistant", "home-assistant_v2", "idb-keyval", "localforage"];
-        for (const name of guesses) {
-          await new Promise((res) => {
-            const req = indexedDB.deleteDatabase(name);
-            req.onsuccess = req.onerror = req.onblocked = () => res();
-          });
-          deleted.push(name + " (guessed)");
+
+        req.onsuccess = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve("success"); // silent success
+        };
+        req.onerror = (ev) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // Real error
+          log?.(`IndexedDB: error deleting "${name}"`);
+          resolve("error");
+        };
+        req.onblocked = () => {
+          // If other tabs/connections hold the DB, deletion is blocked.
+          // We don't log or wait forever; the timeout will resolve gently.
+          // (Final status will show remaining DBs.)
+        };
+      });
+
+    try {
+      // Collect candidate DB names.
+      let names = [];
+      if (indexedDB && typeof indexedDB.databases === "function") {
+        try {
+          const dbs = await indexedDB.databases();
+          if (Array.isArray(dbs)) {
+            names = dbs
+              .map((d) => d && d.name)
+              .filter((n) => typeof n === "string" && n.length > 0);
+          }
+        } catch {
+          // ignore, we'll fall back
         }
       }
-      log(`IndexedDB: requested delete for ${deleted.length} DB(s)${deleted.length ? `: ${deleted.join(", ")}` : ""}`);
+      if (!names.length) {
+        names = [
+          "home-assistant",
+          "home-assistant_v2",
+          "idb-keyval",
+          "localforage",
+        ];
+      }
+
+      // Delete sequentially with micro-yield to avoid UI jank.
+      for (const name of names) {
+        await deleteDb(name);
+        // Yield to event loop so HA/UI stays responsive.
+        await new Promise((r) => setTimeout(r, 0));
+      }
     } catch (e) {
-      log(`IndexedDB: ${e}`);
+      log?.(`IndexedDB: error ${e}`);
     }
   };
 
   const clearCacheStorage = async (log) => {
     try {
-      if (!("caches" in window)) { log("Cache Storage: not supported"); return; }
+      if (!("caches" in window)) return;
       const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
-      log(`Cache Storage: deleted ${keys.length} cache(s)`);
+      await Promise.all(keys.map((k) => caches.delete(k).catch(() => {})));
     } catch (e) {
-      log(`Cache Storage: ${e}`);
+      log(`Cache Storage: error ${e}`);
     }
   };
 
   const clearServiceWorkers = async (log) => {
     try {
-      if (!(navigator.serviceWorker?.getRegistrations)) { log("Service Workers: no API / none registered"); return; }
+      if (!navigator.serviceWorker?.getRegistrations) return;
       const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-      log(`Service Workers: unregistered ${regs.length} registration(s)`);
+      await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
     } catch (e) {
-      log(`Service Workers: ${e}`);
+      log(`Service Workers: error ${e}`);
     }
   };
 
-  const logStorageEstimate = async (log) => {
+  const getStorageEstimate = async (log) => {
     try {
       if (navigator.storage?.estimate) {
         const est = await navigator.storage.estimate();
-        log(`Total usage: ${formatBytes(est.usage)} (quota: ${formatBytes(est.quota)})`);
+        log(
+          `Total usage: ${formatBytes(est.usage)} (quota: ${formatBytes(
+            est.quota
+          )})`
+        );
       }
-    } catch {/* ignore */}
+    } catch {
+      /* ignore */
+    }
   };
 
   // Non-destructive functions to get storage state
@@ -165,8 +233,12 @@
     try {
       if (indexedDB && "databases" in indexedDB && indexedDB.databases) {
         const dbs = await indexedDB.databases();
-        const validDbs = dbs.filter(db => db?.name);
-        log(`IndexedDB: ${validDbs.length} database${validDbs.length === 1 ? "" : "s"}`);
+        const validDbs = dbs.filter((db) => db?.name);
+        log(
+          `IndexedDB: ${validDbs.length} database${
+            validDbs.length === 1 ? "" : "s"
+          }`
+        );
       } else {
         log(`IndexedDB: enumeration not supported`);
       }
@@ -190,23 +262,43 @@
 
   const getServiceWorkersState = async (log) => {
     try {
-      if (!(navigator.serviceWorker?.getRegistrations)) {
+      if (!navigator.serviceWorker?.getRegistrations) {
         log("Service Workers: no API / none registered");
         return;
       }
       const regs = await navigator.serviceWorker.getRegistrations();
-      log(`Service Workers: ${regs.length} registration${regs.length === 1 ? "" : "s"}`);
+      log(
+        `Service Workers: ${regs.length} registration${
+          regs.length === 1 ? "" : "s"
+        }`
+      );
     } catch (e) {
       log(`Service Workers: ${e}`);
     }
   };
 
+  const logStorageState = async (log) => {
+    await getLocalStorageState(log);
+    await getSessionStorageState(log);
+    await getCookiesState(log);
+    await getIndexedDBState(log);
+    await getCacheStorageState(log);
+    await getServiceWorkersState(log);
+    await getStorageEstimate(log);
+  };
+
   // -------- Card View --------
   class NukeStorageCard extends HTMLElement {
-    static getStubConfig() { return { ...DEFAULTS }; }
-    static getConfigElement() { return document.createElement("nuke-storage-card-editor"); }
+    static getStubConfig() {
+      return { ...DEFAULTS };
+    }
+    static getConfigElement() {
+      return document.createElement("nuke-storage-card-editor");
+    }
 
-    set hass(hass) { this._hass = hass; }
+    set hass(hass) {
+      this._hass = hass;
+    }
 
     setConfig(config) {
       this._config = { ...DEFAULTS, ...(config || {}) };
@@ -214,10 +306,63 @@
       this._render();
     }
 
-    getCardSize() { return 2; }
+    getCardSize() {
+      return 2;
+    }
 
     async _render() {
       const c = this._config;
+      const buttonTag = customElements.get("ha-button")
+        ? "ha-button"
+        : "button";
+
+      // dialog
+      this._dialog = document.createElement("dialog");
+      const dlgDiv = document.createElement("div");
+      dlgDiv.className = "dlg";
+      dlgDiv.innerHTML = `
+        <h2>What should we clear?</h2>
+        <div class="sub">Pick the data types to remove for <strong>${
+          location.origin
+        }</strong>.</div>
+        <div class="chk-grid">
+          <label><input type="checkbox" id="opt-ls" checked> localStorage</label>
+          <label><input type="checkbox" id="opt-ss" checked> sessionStorage</label>
+          <label><input type="checkbox" id="opt-cookies" checked> Cookies <span class="sub">(HttpOnly cannot be removed)</span></label>
+          <label><input type="checkbox" id="opt-idb" checked> IndexedDB</label>
+          <label><input type="checkbox" id="opt-cache" checked> Cache Storage</label>
+          <label><input type="checkbox" id="opt-sw" checked> Service Workers</label>
+        </div>
+      `;
+
+      const actionsDiv = document.createElement("div");
+      actionsDiv.className = "dlg-actions";
+
+      const cancelBtn = document.createElement(buttonTag);
+      cancelBtn.id = "dlg-cancel";
+      if (buttonTag === "button") cancelBtn.className = "fallback plain";
+      cancelBtn.textContent = "Cancel";
+      if (buttonTag === "ha-button") {
+        cancelBtn.label = "Cancel";
+        cancelBtn.setAttribute("appearance", "plain");
+      }
+      cancelBtn.addEventListener("click", () => {
+        this._dialog.close();
+      });
+
+      const okBtn = document.createElement(buttonTag);
+      okBtn.id = "dlg-ok";
+      if (buttonTag === "button") okBtn.className = "fallback brand";
+      okBtn.textContent = "Clear";
+      okBtn.setAttribute("variant", "danger");
+      if (buttonTag === "ha-button") {
+        okBtn.label = "Nuke";
+      }
+
+      actionsDiv.append(cancelBtn, okBtn);
+      this._dialog.append(dlgDiv, actionsDiv);
+
+      // card
       const card = document.createElement("ha-card");
       card.header = c.title;
 
@@ -305,30 +450,40 @@
         this._logEl = document.createElement("div");
         this._logEl.className = "log";
         this._logEl.setAttribute("aria-live", "polite");
-        this._logEl.setAttribute("aria-label", "Log of storage clearing operations");
+        this._logEl.setAttribute(
+          "aria-label",
+          "Log of storage clearing operations"
+        );
         this._logEl.textContent = "";
         wrap.appendChild(this._logEl);
 
-        // Populate initial storage state
         const log = (msg) => {
-          if (!this._logEl) return;
           this._logEl.textContent += msg + "\n";
         };
-        await getLocalStorageState(log);
-        await getSessionStorageState(log);
-        await getCookiesState(log);
-        await getIndexedDBState(log);
-        await getCacheStorageState(log);
-        await getServiceWorkersState(log);
-        await logStorageEstimate(log);
+      
+        // Populate initial storage state
+        logStorageState(log);
+
+        okBtn.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          this._logEl.textContent = "";
+          await this._runSelected(log);
+        });
+
       } else {
         this._logEl = null;
+        const log = (msg) => {
+          console.info(msg + "\n");
+        };
+        okBtn.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          await this._runSelected(log);
+        });
       }
 
       const actions = document.createElement("div");
       actions.className = "actions";
 
-      const buttonTag = customElements.get("ha-button") ? "ha-button" : "button";
       const btn = document.createElement(buttonTag);
       if (buttonTag === "button") btn.className = "fallback";
       btn.textContent = c.button_label;
@@ -337,53 +492,6 @@
       btn.addEventListener("click", () => this._openDialog());
       actions.appendChild(btn);
       wrap.appendChild(actions);
-
-      // dialog
-      this._dialog = document.createElement("dialog");
-      const dlgDiv = document.createElement("div");
-      dlgDiv.className = "dlg";
-      dlgDiv.innerHTML = `
-        <h3>What should we clear?</h3>
-        <div class="sub">Pick the data types to remove for <strong>${location.origin}</strong>.</div>
-        <div class="chk-grid">
-          <label><input type="checkbox" id="opt-ls" checked> localStorage</label>
-          <label><input type="checkbox" id="opt-ss" checked> sessionStorage</label>
-          <label><input type="checkbox" id="opt-cookies" checked> Cookies <span class="sub">(HttpOnly cannot be removed)</span></label>
-          <label><input type="checkbox" id="opt-idb" checked> IndexedDB</label>
-          <label><input type="checkbox" id="opt-cache" checked> Cache Storage</label>
-          <label><input type="checkbox" id="opt-sw" checked> Service Workers</label>
-          <label><input type="checkbox" id="opt-reload" ${c.default_reload_after ? "checked" : ""}> Reload after</label>
-        </div>
-      `;
-
-      const actionsDiv = document.createElement("div");
-      actionsDiv.className = "dlg-actions";
-
-      const cancelBtn = document.createElement(buttonTag);
-      cancelBtn.id = "dlg-cancel";
-      if (buttonTag === "button") cancelBtn.className = "fallback plain";
-      cancelBtn.textContent = "Cancel";
-      if (buttonTag === "ha-button") {
-        cancelBtn.label = "Cancel";
-        cancelBtn.setAttribute("appearance", "plain");
-      }
-      cancelBtn.addEventListener("click", () => { this._dialog.close(); });
-
-      const okBtn = document.createElement(buttonTag);
-      okBtn.id = "dlg-ok";
-      if (buttonTag === "button") okBtn.className = "fallback brand";
-      okBtn.textContent = "Clear";
-      if (buttonTag === "ha-button") {
-        okBtn.label = "Nuke";
-      }
-      okBtn.addEventListener("click", async (ev) => {
-        ev.preventDefault();
-        await this._runSelected();
-      });
-
-      actionsDiv.append(cancelBtn, okBtn);
-      this._dialog.append(dlgDiv, actionsDiv);
-
       card.appendChild(style);
       card.appendChild(wrap);
       card.appendChild(this._dialog);
@@ -396,43 +504,56 @@
       if (!this._dialog.open) this._dialog.showModal();
     }
 
-    async _runSelected() {
+    async _runSelected(log) {
       const d = this._dialog;
       const get = (id) => d.querySelector(id).checked;
 
-      const toRun = [];
-      const log = (msg) => {
-        if (!this._logEl) return;
-        this._logEl.textContent += (this._logEl.textContent ? "\n" : "") + msg;
+      const selections = {
+        ls: get("#opt-ls"),
+        ss: get("#opt-ss"),
+        cookies: get("#opt-cookies"),
+        idb: get("#opt-idb"),
+        cache: get("#opt-cache"),
+        sw: get("#opt-sw"),
       };
 
-      await logStorageEstimate(log);
-
-      if (get("#opt-ls")) toRun.push((l) => clearLocalStorage(l));
-      if (get("#opt-ss")) toRun.push((l) => clearSessionStorage(l));
-      if (get("#opt-cookies")) toRun.push((l) => clearCookies(l));
-      if (get("#opt-idb")) toRun.push((l) => clearIndexedDBAll(l));
-      if (get("#opt-cache")) toRun.push((l) => clearCacheStorage(l));
-      if (get("#opt-sw")) toRun.push((l) => clearServiceWorkers(l));
+      const chooseBtn = this.shadowRoot?.querySelector(
+        ".actions ha-button, .actions button"
+      );
+      if (chooseBtn) {
+        if (chooseBtn.tagName === "HA-BUTTON")
+          chooseBtn.setAttribute("disabled", "");
+        else chooseBtn.disabled = true;
+      }
 
       const okBtn = d.querySelector("#dlg-ok");
       okBtn.disabled = true;
 
       try {
+        if (d?.open) d.close();
+      } catch {}
+
+      log('Clearing ...');
+
+      const toRun = [];
+      if (selections.sw) toRun.push((l) => clearServiceWorkers(l));
+      if (selections.cache) toRun.push((l) => clearCacheStorage(l));
+      if (selections.ls) toRun.push((l) => clearLocalStorage(l));
+      if (selections.ss) toRun.push((l) => clearSessionStorage(l));
+      if (selections.cookies) toRun.push((l) => clearCookies(l));
+      if (selections.idb) toRun.push((l) => clearIndexedDBAll(l));
+
+      try {
         for (const op of toRun) {
           await op(log);
         }
-        await logStorageEstimate(log);
+        await logStorageState(log);
       } finally {
-        okBtn.disabled = false;
-        const reload = get("#opt-reload");
         d.close();
-        if (reload) setTimeout(() => location.reload(), 200);
+        setTimeout(() => location.reload(), 200);
       }
     }
   }
-
-
 
   // -------- Card Editor (Designer) --------
   class NukeStorageCardEditor extends HTMLElement {
@@ -441,7 +562,9 @@
       if (!this.shadowRoot) this.attachShadow({ mode: "open" });
       this._render();
     }
-    set hass(hass) { this._hass = hass; }
+    set hass(hass) {
+      this._hass = hass;
+    }
 
     _render() {
       const c = this._config;
@@ -473,10 +596,6 @@
           <input type="checkbox" id="show" ${c.show_details ? "checked" : ""}>
           <label for="show">Show log details</label>
         </div>
-        <div class="chk">
-          <input type="checkbox" id="ra" ${c.default_reload_after ? "checked" : ""}>
-          <label for="ra">Default: Reload after</label>
-        </div>
       `;
 
       const emit = () => {
@@ -489,10 +608,11 @@
           description: descInput || DEFAULTS.description,
           button_label: btnInput || DEFAULTS.button_label,
           show_details: root.querySelector("#show").checked,
-          default_reload_after: root.querySelector("#ra").checked,
         };
         this._config = detail;
-        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: detail } }));
+        this.dispatchEvent(
+          new CustomEvent("config-changed", { detail: { config: detail } })
+        );
       };
 
       // Explicitly bind events to each input
@@ -500,14 +620,14 @@
       const descInput = root.querySelector("#desc");
       const btnInput = root.querySelector("#btn");
       const showCheckbox = root.querySelector("#show");
-      const raCheckbox = root.querySelector("#ra");
 
       // Handle Enter key to save configuration
       const handleEnter = (e) => {
         if (e.key === "Enter") {
           emit();
           // Find the closest form or editor container and dispatch a submit event
-          const form = e.target.closest("form") || e.target.closest("ha-dialog");
+          const form =
+            e.target.closest("form") || e.target.closest("ha-dialog");
           if (form) {
             form.dispatchEvent(new Event("submit", { cancelable: true }));
           }
@@ -527,7 +647,6 @@
       btnInput.addEventListener("keydown", handleEnter);
 
       showCheckbox.addEventListener("change", emit);
-      raCheckbox.addEventListener("change", emit);
 
       this.shadowRoot.innerHTML = "";
       this.shadowRoot.append(style, root);
@@ -546,7 +665,8 @@
   window.customCards.push({
     type: "nuke-storage-card",
     name: "Nuke Storage Card",
-    description: "Clear selected site data (localStorage, sessionStorage, cookies, IndexedDB, caches, service workers).",
-    preview: true
+    description:
+      "Clear selected site data (localStorage, sessionStorage, cookies, IndexedDB, caches, service workers).",
+    preview: true,
   });
 })();
