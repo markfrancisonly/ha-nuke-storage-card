@@ -1,7 +1,7 @@
 // nuke-storage-card.js
 // Home Assistant custom card: Nuke Storage Card
 // Dialog with checkboxes for which storage to clear, then reloads.
-// v1.0.30
+// v1.0.31
 
 (() => {
   const DEFAULTS = {
@@ -12,7 +12,6 @@
     show_details: true
   };
 
-  // -------- Utilities --------
   const formatBytes = (n) => {
     if (n === undefined || n === null) return "n/a";
     const k = 1024;
@@ -281,9 +280,9 @@
     await getLocalStorageState(log);
     await getSessionStorageState(log);
     await getCookiesState(log);
-    await getIndexedDBState(log);
     await getCacheStorageState(log);
     await getServiceWorkersState(log);
+    await getIndexedDBState(log);
     await getStorageEstimate(log);
   };
 
@@ -329,9 +328,9 @@
           <label><input type="checkbox" id="opt-ls" checked> localStorage</label>
           <label><input type="checkbox" id="opt-ss" checked> sessionStorage</label>
           <label><input type="checkbox" id="opt-cookies" checked> Cookies <span class="sub">(HttpOnly cannot be removed)</span></label>
-          <label><input type="checkbox" id="opt-idb" checked> IndexedDB</label>
           <label><input type="checkbox" id="opt-cache" checked> Cache Storage</label>
           <label><input type="checkbox" id="opt-sw" checked> Service Workers</label>
+          <label><input type="checkbox" id="opt-idb" checked> IndexedDB</label>
         </div>
       `;
 
@@ -536,11 +535,11 @@
       log('Clearing ...');
 
       const toRun = [];
-      if (selections.sw) toRun.push((l) => clearServiceWorkers(l));
-      if (selections.cache) toRun.push((l) => clearCacheStorage(l));
       if (selections.ls) toRun.push((l) => clearLocalStorage(l));
       if (selections.ss) toRun.push((l) => clearSessionStorage(l));
       if (selections.cookies) toRun.push((l) => clearCookies(l));
+      if (selections.cache) toRun.push((l) => clearCacheStorage(l));
+      if (selections.sw) toRun.push((l) => clearServiceWorkers(l));
       if (selections.idb) toRun.push((l) => clearIndexedDBAll(l));
 
       try {
@@ -555,7 +554,6 @@
     }
   }
 
-  // -------- Card Editor (Designer) --------
   class NukeStorageCardEditor extends HTMLElement {
     setConfig(config) {
       this._config = { ...DEFAULTS, ...(config || {}) };
@@ -660,7 +658,6 @@
     customElements.define("nuke-storage-card-editor", NukeStorageCardEditor);
   }
 
-  // -------- Card Picker Metadata --------
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: "nuke-storage-card",
